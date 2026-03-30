@@ -1,0 +1,14 @@
+# ────────────────────────────────────────────
+# AI-PWNDOC : CONFIGURATION
+# ────────────────────────────────────────────
+
+pwndoc:
+  base_url: "https://localhost:8443"    
+  username: "admin"                     # Change this
+  password: "admin"                     # Change this
+  verify_ssl: false                     # Use in prod
+
+llm:
+  provider: "claude"                    # claude | gemini 
+  anthropic_api_key: "sk-ant-api..."    # If using Claude 
+  model: "claude-haiku-4-5"             # claude-opus-4-6 | claude-sonnet-4-6 | claude-haiku-4-5
