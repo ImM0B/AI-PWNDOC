@@ -4,27 +4,36 @@ Automated vulnerability writing for [PwnDoc](https://github.com/pwndoc/pwndoc) u
 
 Takes a folder of Obsidian-style `.md` notes — one per vulnerability — analyses the text and any embedded screenshots, and pushes fully structured findings directly into a PwnDoc audit. Supports **Claude** (via Anthropic API) and **Gemini** (via CLI).
 
+![graph](graph.png)
+
 ---
 
 ## Project structure
 
 ```
-ObsidianAuditNotes/
 ├── ai-pwndoc.py
 ├── config.yml
 ├── requirements.txt
 ├── vulnerabilities.yml
-└── SampleWebAudit/          ← audit folder example passed as argument
-    ├── MASS ASSIGMENT.md
-    ├── SSTI.md
-    ├── MA1.png
-    ├── MA2.png
-    ├── MA3.png
-    ├── SSTI1.png
-    └── SSTI2.png
+└── SampleAudits
+    ├── ADPentest
+    │   ├── AS-REP ROASTING.md
+    │   ├── AS-REP1.png
+    │   ├── AS-REP2.png
+    │   ├── AS-REP3.png
+    │   ├── RBCD1.png
+    │   ├── RBCD2.png
+    │   ├── RBCD3.png
+    │   └── Resource-Based Constrained Delegation.md
+    └── WebAudit
+        ├── MA1.png
+        ├── MA2.png
+        ├── MA3.png
+        ├── MASS ASSIGMENT.md
+        ├── Server-Side Template Injection.md
+        ├── SSTI1.png
+        └── SSTI2.png
 ```
-
-The script lives at the root alongside `config.yml`, `requirements.txt`, and `vulnerabilities.yml` (your examples file). Each audit is a subfolder containing all `.md` notes and screenshots together — no subdirectory nesting needed.
 
 ---
 
@@ -74,14 +83,6 @@ llm:
   claude_model: "claude-haiku-4-5"   # default model
 ```
 
-### Available Claude models
-
-| Model | Speed | Quality |
-|---|---|---|
-| `claude-haiku-4-5` | ⚡ fastest | good — **default** |
-| `claude-sonnet-4-5` | fast | better |
-| `claude-opus-4-5` | slower | best |
-
 ---
 
 ## Examples file
@@ -100,8 +101,6 @@ Pass a `.yml` with real vulnerability examples from past reports. The AI learns 
     - "https://owasp.org/www-community/attacks/SQL_Injection"
   cvssv3: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
 ```
-
-Up to 5 examples are included in the prompt.
 
 ---
 
@@ -131,25 +130,25 @@ python ai-pwndoc.py <audit-folder> -e vulnerabilities.yml [options]
 
 ```bash
 # Basic run — interactive audit selection
-python ai-pwndoc.py SampleWebAudit/ -e vulnerabilities.yml
+python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml
 
 # English output, Gemini provider
-python ai-pwndoc.py SampleWebAudit/ -e vulnerabilities.yml --provider gemini --lang en
+python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml --provider gemini --lang en
 
 # Use a more powerful Claude model
-python ai-pwndoc.py SampleWebAudit/ -e vulnerabilities.yml --model claude-opus-4-5
+python ai-pwndoc.py SampleAudits/ADPentest/ -e vulnerabilities.yml --model claude-opus-4-5
 
 # Inject extra instructions into the prompt
-python ai-pwndoc.py SampleWebAudit/ -e vulnerabilities.yml --instructions "Always include the CWE identifier in the description."
+python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml --instructions "Always include the CWE identifier in the description."
 
 # Skip interactive audit selection
-python ai-pwndoc.py SampleWebAudit/ -e vulnerabilities.yml --audit-id 6657f1a2c3b4e500123abc
+python ai-pwndoc.py SampleAudits/ADPentest/ -e vulnerabilities.yml --audit-id 6657f1a2c3b4e500123abc
 
 # Test without uploading anything
-python ai-pwndoc.py SampleWebAudit/ -e vulnerabilities.yml --dry-run
+python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml --dry-run
 
 # Full run, English, specific audit, best model
-python ai-pwndoc.py SampleWebAudit/ -e vulnerabilities.yml \
+python ai-pwndoc.py SampleAudits/ADPentest/ -e vulnerabilities.yml \
   --lang en \
   --model claude-opus-4-5 \
   --audit-id 6657f1a2c3b4e500123abc
