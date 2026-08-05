@@ -4,11 +4,20 @@
 
 pwndoc:
   base_url: "https://localhost:8443"    
-  username: "admin"                     # Change this
-  password: "admin"                     # Change this
+  username: ""                          # Change this
+  password: ""                          # Change this
   verify_ssl: false                     # Use in prod
 
 llm:
-  provider: "claude"                    # claude | gemini 
-  anthropic_api_key: "sk-ant-api..."    # If using Claude 
-  model: "claude-haiku-4-5"             # claude-opus-4-6 | claude-sonnet-4-6 | claude-haiku-4-5
+  provider: "claude"                    # claude | claude-code | gemini
+
+  # provider: claude  → Anthropic REST API (pay per token)
+  anthropic_api_key: "sk-ant-api..."
+  claude_model: "claude-haiku-4-5"      # claude-opus-4-6 | claude-sonnet-4-6 | claude-haiku-4-5
+
+  # provider: claude-code → local Claude Code CLI, uses your normal subscription login.
+  # No API key needed; run `claude` once and log in. ANTHROPIC_API_KEY is stripped from
+  # the environment so billing stays on the subscription.
+  claude_code_binary: "claude"          # path to the claude CLI
+  claude_code_model: ""                 # "" = CLI default | opus | sonnet | haiku | full model id
+  claude_code_timeout: 300              # seconds per call

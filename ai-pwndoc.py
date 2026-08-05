@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 AI-PWNDOC: Automated vulnerability writing for PwnDoc using AI
-Supports: Claude API, Gemini CLI
+Supports: Claude API, Claude Code CLI (subscription), Gemini CLI
 """
 
 import argparse
 import base64
 import json
 import mimetypes
+import os
 import re
 import subprocess
 import sys
@@ -40,6 +41,9 @@ DEFAULT_CONFIG = {
         "provider": "claude",
         "anthropic_api_key": "",
         "claude_model": "claude-haiku-4-5",
+        "claude_code_binary": "claude",
+        "claude_code_model": "",
+        "claude_code_timeout": 300,
     },
 }
 
@@ -148,6 +152,12 @@ INSTRUCTIONS:
 - Reply ONLY with valid JSON — no markdown, no extra explanations.
 - Use null for any field you don't have enough information for.
 - ALL text fields must be written in the output language specified above.
+- "description": theoretical explanation of what the vulnerability class is — how it works, why it
+  exists and the general attack scenario. Generic and technology-agnostic: NO client names, NO
+  specific hosts, URLs, IPs or evidence from this engagement.
+- "observation": impact analysis for this specific finding, explicitly covering the three security
+  properties — confidentiality, integrity and availability. State for each one whether it is
+  affected and how; if a property is not affected, say so briefly and why.
 - "remediation" must be concise and actionable.
 - "references" must be a list of strings with relevant URLs.
 - "remediationComplexity": 1 (Easy), 2 (Medium), 3 (Hard)
@@ -170,15 +180,27 @@ Reply with exactly this JSON:
 }}
 """
 
-IMAGE_ANALYSIS_SYSTEM_PROMPT = """You are a cybersecurity expert specialised in writing professional penetration testing reports.
-Analyse the provided evidence screenshot in the context of the described vulnerability.
+EVIDENCE_ANALYSIS_SYSTEM_PROMPT = """You are a cybersecurity expert specialised in writing professional penetration testing reports.
+You are given the vulnerability context and ALL the evidence screenshots for a single finding.
 
 OUTPUT LANGUAGE: {lang_instruction}
 
+Write the EVIDENCE section of the report as a single, cohesive narrative that walks the reader
+through how the vulnerability was demonstrated, leaning on the screenshots and describing what
+they show only where it adds clarity. Do NOT produce a separate description per screenshot and do
+NOT restate every image one by one; write flowing prose for the section as a whole.
+
+Also provide a short caption (pie de foto) for each screenshot, in the same order they were given.
+
+INSTRUCTIONS:
+- "evidence": HTML for the evidence section. Use <p> paragraphs (and <ul>/<li>, <code> where
+  useful). Do NOT include any <img> tags — images are inserted separately.
+- "captions": list with exactly one caption per screenshot, same order as provided, 15 words max each.
+
 Reply ONLY with valid JSON in exactly this format — no markdown, no explanations:
 {{
-  "description": "Detailed technical explanation of what the screenshot shows and its relevance as evidence for the vulnerability",
-  "caption": "Short descriptive caption (15 words max)"
+  "evidence": "<p>...</p>",
+  "captions": ["...", "..."]
 }}
 """
 
@@ -238,6 +260,78 @@ def call_claude_api(system_prompt: str, user_prompt: str, images: list, api_key:
     return "".join(block["text"] for block in data["content"] if block["type"] == "text")
 
 
+def call_claude_code_cli(system_prompt: str, user_prompt: str, images: list, cfg: dict) -> str:
+    """Call Claude through the Claude Code CLI, using the local subscription login.
+
+    No API key is needed: `claude -p` reuses the OAuth session of the installed CLI.
+    Images are passed as absolute paths and read by the built-in Read tool.
+    """
+    import tempfile
+
+    llm_cfg = cfg.get("llm", {})
+    binary  = llm_cfg.get("claude_code_binary") or "claude"
+    model   = llm_cfg.get("claude_code_model") or ""
+    timeout = int(llm_cfg.get("claude_code_timeout") or 300)
+
+    prompt = user_prompt
+    if images:
+        prompt += "\n\nRead these evidence image files with the Read tool before answering:"
+        for img_path in images:
+            prompt += f"\n{Path(img_path).resolve()}"
+    prompt += "\n\nOutput ONLY the raw JSON object. No preamble, no markdown fences, no commentary."
+
+    dirs_to_include = set()
+    md_path = cfg.get("_md_path", "")
+    if md_path:
+        dirs_to_include.add(str(Path(md_path).resolve().parent))
+    for img in images:
+        dirs_to_include.add(str(Path(img).resolve().parent))
+
+    cmd = [
+        binary, "-p", prompt,
+        "--system-prompt", system_prompt,
+        "--output-format", "json",
+        "--permission-mode", "bypassPermissions",
+        "--tools", "Read",
+        "--safe-mode",              # ignore local hooks/plugins/CLAUDE.md that could pollute stdout
+        "--no-session-persistence",
+    ]
+    if model:
+        cmd += ["--model", model]
+    for d in sorted(dirs_to_include):
+        cmd += ["--add-dir", d]
+
+    # Drop ANTHROPIC_API_KEY so the CLI authenticates with the subscription, not pay-per-token API.
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                cwd=tmpdir, env=env, timeout=timeout,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"'{binary}' CLI not found. Install Claude Code: https://claude.com/claude-code"
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Claude Code CLI timed out after {timeout}s")
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Claude Code CLI error (rc={result.returncode}):\n{result.stderr.strip()}")
+
+    out = result.stdout.strip()
+    try:
+        envelope = json.loads(out)
+    except json.JSONDecodeError:
+        return out  # already plain text
+    if isinstance(envelope, dict):
+        if envelope.get("is_error"):
+            raise RuntimeError(f"Claude Code CLI returned an error: {envelope.get('result', out)}")
+        return str(envelope.get("result", out))
+    return out
+
+
 def call_gemini_cli(system_prompt: str, user_prompt: str, images: list, md_path: str = "") -> str:
     import tempfile
     prompt = f"{system_prompt}\n\n{user_prompt}"
@@ -272,6 +366,8 @@ def call_gemini_cli(system_prompt: str, user_prompt: str, images: list, md_path:
 def call_llm(provider: str, system_prompt: str, user_prompt: str, images: list, cfg: dict) -> str:
     if provider == "claude":
         return call_claude_api(system_prompt, user_prompt, images, cfg["llm"].get("anthropic_api_key", ""), cfg["llm"].get("claude_model", "claude-haiku-4-5"))
+    elif provider == "claude-code":
+        return call_claude_code_cli(system_prompt, user_prompt, images, cfg)
     elif provider == "gemini":
         return call_gemini_cli(system_prompt, user_prompt, images, cfg.get("_md_path", ""))
     else:
@@ -282,40 +378,47 @@ def call_llm(provider: str, system_prompt: str, user_prompt: str, images: list, 
 # IMAGE ANALYSIS
 # ──────────────────────────────────────────────
 
-def analyze_image(provider: str, image_path: str, vuln_context: str,
-                  lang_instruction: str, cfg: dict) -> dict:
-    system_prompt = IMAGE_ANALYSIS_SYSTEM_PROMPT.format(lang_instruction=lang_instruction)
-    user_prompt = (
-        f"Vulnerability context:\n{vuln_context}\n\n"
-        f"Analyse the attached image '{Path(image_path).name}' as evidence of this vulnerability."
-    )
-    try:
-        raw = call_llm(provider, system_prompt, user_prompt, [image_path], cfg)
-        return extract_json(raw)
-    except Exception as e:
-        console.print(f"  [yellow]⚠ Could not analyse {Path(image_path).name}: {e}[/yellow]")
-        name = Path(image_path).stem.replace("_", " ").replace("-", " ").capitalize()
-        return {"description": "", "caption": name}
+def _fallback_caption(image_path: str) -> str:
+    return Path(image_path).stem.replace("_", " ").replace("-", " ").capitalize()
 
 
-def analyze_all_images(provider: str, images: list, vuln: dict,
-                       lang_instruction: str, cfg: dict) -> list:
+def analyze_evidence(provider: str, images: list, vuln: dict,
+                     lang_instruction: str, cfg: dict) -> dict:
+    """One call over ALL screenshots: returns a cohesive evidence narrative plus one caption per image.
+
+    Returns {"evidence": <html str>, "captions": [<str>, ...]} with captions aligned to `images`.
+    """
     if not images:
-        return []
+        return {"evidence": "", "captions": []}
+
     vuln_context = (
         f"Title: {vuln.get('title', '')}\n"
         f"Description: {vuln.get('description', '')}\n"
         f"Observation: {vuln.get('observation', '')}"
     )
-    results = []
-    for img_path in images:
-        analysis = analyze_image(provider, img_path, vuln_context, lang_instruction, cfg)
-        results.append({
-            "path": img_path,
-            "description": analysis.get("description", ""),
-            "caption": analysis.get("caption", Path(img_path).stem),
-        })
-    return results
+    system_prompt = EVIDENCE_ANALYSIS_SYSTEM_PROMPT.format(lang_instruction=lang_instruction)
+    image_names = ", ".join(Path(p).name for p in images)
+    user_prompt = (
+        f"Vulnerability context:\n{vuln_context}\n\n"
+        f"Screenshots ({len(images)}), in order: {image_names}\n\n"
+        f"Write the evidence section and one caption per screenshot."
+    )
+
+    try:
+        raw = call_llm(provider, system_prompt, user_prompt, images, cfg)
+        data = extract_json(raw)
+    except Exception as e:
+        console.print(f"  [yellow]⚠ Could not analyse evidence: {e}[/yellow]")
+        return {"evidence": "", "captions": [_fallback_caption(p) for p in images]}
+
+    evidence = data.get("evidence", "") or ""
+    captions = data.get("captions") or []
+    # Align captions to images: pad / fall back where the model came up short.
+    captions = [
+        (captions[i] if i < len(captions) and captions[i] else _fallback_caption(images[i]))
+        for i in range(len(images))
+    ]
+    return {"evidence": evidence, "captions": captions}
 
 
 # ──────────────────────────────────────────────
@@ -399,6 +502,33 @@ class PwnDocAPI:
         resp.raise_for_status()
         return resp.json()["datas"]
 
+    def get_languages(self) -> list:
+        try:
+            resp = self.session.get(f"{self.base_url}/api/data/languages", verify=self.verify_ssl, timeout=30)
+            resp.raise_for_status()
+            return resp.json()["datas"]
+        except Exception:
+            return []
+
+    def get_audit_types(self) -> list:
+        try:
+            resp = self.session.get(f"{self.base_url}/api/data/audit-types", verify=self.verify_ssl, timeout=30)
+            resp.raise_for_status()
+            return resp.json()["datas"]
+        except Exception:
+            return []
+
+    def create_audit(self, name: str, language: str, audit_type: str) -> dict:
+        resp = self.session.post(
+            f"{self.base_url}/api/audits",
+            json={"name": name, "language": language, "auditType": audit_type},
+            verify=self.verify_ssl, timeout=30,
+        )
+        resp.raise_for_status()
+        datas = resp.json()["datas"]
+        # PwnDoc replies {"message": "...", "audit": {...}}; older builds return the audit directly.
+        return datas.get("audit", datas)
+
     def upload_image(self, image_path: str) -> str:
         mime, _ = mimetypes.guess_type(image_path)
         if not mime:
@@ -416,19 +546,17 @@ class PwnDocAPI:
             raise RuntimeError(f"PwnDoc did not return _id: {resp.text}")
         return image_id
 
-    def add_finding(self, audit_id: str, vuln_data: dict, image_analyses: list,
-                    image_ids: list, proofs_header: str) -> dict:
+    def add_finding(self, audit_id: str, vuln_data: dict, evidence_html: str,
+                    captions: list, image_ids: list, proofs_header: str) -> dict:
         poc_parts = [proofs_header]
-        for analysis, img_id in zip(image_analyses, image_ids):
-            if analysis.get("description"):
-                poc_parts.append(f'<p>{analysis["description"]}</p>')
-            caption = analysis.get("caption", "")
+        if evidence_html:
+            poc_parts.append(evidence_html)
+        for i, img_id in enumerate(image_ids):
+            caption = captions[i] if i < len(captions) else ""
             if caption:
                 poc_parts.append(f'<p><img src="{img_id}" alt="{caption}"></p>')
             else:
                 poc_parts.append(f'<p><img src="{img_id}"></p>')
-        for img_id in image_ids[len(image_analyses):]:
-            poc_parts.append(f'<p><img src="{img_id}"></p>')
 
         body = {
             "title":                 vuln_data.get("title", ""),
@@ -456,17 +584,62 @@ class PwnDocAPI:
 # AUDIT SELECTION
 # ──────────────────────────────────────────────
 
+def _pick_from(api_items: list, key: str, label: str, prompt: str, show_key: str = "") -> str:
+    """Show a numbered list and return the chosen value; free text if the list is empty."""
+    if not api_items:
+        return Prompt.ask(f"{label} (free text)")
+    for i, item in enumerate(api_items, 1):
+        console.print(f"  {i}. [bold]{item.get(show_key or key, '')}[/bold]")
+    choice = Prompt.ask(prompt, default="1")
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(api_items):
+            return api_items[idx].get(key, "")
+    except ValueError:
+        pass
+    return choice
+
+
+def create_audit_interactive(api: PwnDocAPI) -> str:
+    console.print("\n[bold]New audit[/bold]")
+    name = Prompt.ask("Audit name")
+
+    console.print("\n[dim]Language:[/dim]")
+    languages = [
+        {**lang, "label": f"{lang.get('language', '')} ({lang.get('locale', '')})"}
+        for lang in api.get_languages()
+    ]
+    language = _pick_from(languages, "locale", "Language locale", "Select language number", show_key="label")
+
+    console.print("\n[dim]Audit type:[/dim]")
+    audit_types = api.get_audit_types()
+    audit_type = _pick_from(audit_types, "name", "Audit type", "Select audit type number")
+
+    audit = api.create_audit(name, language, audit_type)
+    audit_id = audit["_id"]
+    console.print(f"[green]✓[/green] Audit created: [bold]{name}[/bold]  [dim]{audit_id}[/dim]")
+    return audit_id
+
+
 def select_audit(api: PwnDocAPI) -> str:
     audits = api.get_audits()
-    if not audits:
-        console.print("[red]No audits available.[/red]")
-        sys.exit(1)
     for i, audit in enumerate(audits, 1):
         console.print(f"  {i}. [bold]{audit.get('name', 'Unnamed')}[/bold]  [dim]{audit['_id']}[/dim]")
-    idx = int(Prompt.ask("Select audit number")) - 1
-    audit_id = audits[idx]["_id"]
-    console.print(f"[green]✓[/green] Audit: [bold]{audits[idx].get('name')}[/bold]")
-    return audit_id
+    console.print("  [bold cyan]n[/bold cyan]. Create new audit")
+
+    while True:
+        choice = Prompt.ask("Select audit number (or 'n' for new)").strip()
+        if choice.lower() in ("n", "new"):
+            return create_audit_interactive(api)
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            console.print("[red]Invalid selection.[/red]")
+            continue
+        if 0 <= idx < len(audits):
+            console.print(f"[green]✓[/green] Audit: [bold]{audits[idx].get('name')}[/bold]")
+            return audits[idx]["_id"]
+        console.print("[red]Invalid selection.[/red]")
 
 
 # ──────────────────────────────────────────────
@@ -520,13 +693,16 @@ def process_md_file(
     # Display result
     print_vuln(vuln, name)
 
-    # Analyse images
-    image_analyses = []
+    # Analyse evidence (single cohesive narrative + one caption per image)
+    evidence_html = ""
+    captions = []
     if images and not no_images:
-        with console.status(f"  ◎  analysing {len(images)} image(s)..."):
-            image_analyses = analyze_all_images(provider, images, vuln, lang_instruction, cfg)
-        for a in image_analyses:
-            console.print(f"  ◌  [dim]{Path(a['path']).name}[/dim]  [dim italic]{a['caption']}[/dim italic]")
+        with console.status(f"  ◎  writing evidence from {len(images)} image(s)..."):
+            evidence = analyze_evidence(provider, images, vuln, lang_instruction, cfg)
+        evidence_html = evidence["evidence"]
+        captions = evidence["captions"]
+        for img, cap in zip(images, captions):
+            console.print(f"  ◌  [dim]{Path(img).name}[/dim]  [dim italic]{cap}[/dim italic]")
 
     if dry_run:
         return True
@@ -543,7 +719,7 @@ def process_md_file(
 
     # Add finding
     try:
-        api.add_finding(audit_id, vuln, image_analyses[:len(image_ids)], image_ids, proofs_header)
+        api.add_finding(audit_id, vuln, evidence_html, captions[:len(image_ids)], image_ids, proofs_header)
         console.print(f"  ●  [green]added[/green]  [bold]{vuln.get('title', name)}[/bold]")
         return True
     except Exception as e:
@@ -563,6 +739,8 @@ def main():
 Examples:
   python ai-pwndoc.py Audit1/ -e examples.yml
   python ai-pwndoc.py Audit1/ -e examples.yml --provider gemini --lang en
+  python ai-pwndoc.py Audit1/ -e examples.yml --provider claude-code          # uses Claude Code subscription
+  python ai-pwndoc.py Audit1/ -e examples.yml --provider claude-code -m opus
   python ai-pwndoc.py Audit1/ -e examples.yml --model claude-opus-4-5
   python ai-pwndoc.py Audit1/ -e examples.yml --instructions "Always include CWE identifier"
   python ai-pwndoc.py Audit1/ -e examples.yml --audit-id abc123 --dry-run
@@ -570,14 +748,18 @@ Examples:
     )
     parser.add_argument("folder",            help="Folder containing Obsidian .md notes")
     parser.add_argument("--examples", "-e",  required=True, help=".yml file with example vulnerabilities")
-    parser.add_argument("--provider", "-p",  choices=["claude", "gemini"],
-                        default=None,        help="AI provider (overrides config)")
+    parser.add_argument("--provider", "-p",  choices=["claude", "claude-code", "gemini"],
+                        default=None,        help="AI provider (overrides config). "
+                                                  "claude = Anthropic API key | "
+                                                  "claude-code = local Claude Code CLI (subscription) | "
+                                                  "gemini = Gemini CLI")
     parser.add_argument("--config",  "-c",   default="config.yml", help="Config file (default: config.yml)")
     parser.add_argument("--audit-id",        help="Audit ID (skips interactive selection)")
     parser.add_argument("--lang",            choices=["es", "en"], default="es",
                         help="Output language: es (default) | en")
     parser.add_argument("--model",    "-m",  default=None,
-                        help="Claude model override (e.g. claude-opus-4-5)")
+                        help="Model override. claude: full model id (e.g. claude-opus-4-5). "
+                             "claude-code: id or alias (e.g. opus, sonnet, haiku)")
     parser.add_argument("--instructions",    default=None,
                         help="Additional instructions injected into the system prompt")
     parser.add_argument("--dry-run",         action="store_true", help="Do not upload to PwnDoc")
@@ -595,7 +777,13 @@ Examples:
     # --model overrides config value
     if args.model:
         cfg["llm"]["claude_model"] = args.model
-    model_label = cfg["llm"].get("claude_model", "claude-haiku-4-5") if provider == "claude" else provider
+        cfg["llm"]["claude_code_model"] = args.model
+    if provider == "claude":
+        model_label = cfg["llm"].get("claude_model", "claude-haiku-4-5")
+    elif provider == "claude-code":
+        model_label = f"claude-code ({cfg['llm'].get('claude_code_model') or 'CLI default'})"
+    else:
+        model_label = provider
     console.print(f"[dim]provider: {model_label}  |  target: {cfg['pwndoc']['base_url']}  |  lang: {args.lang}[/dim]")
 
     # Discover .md files
