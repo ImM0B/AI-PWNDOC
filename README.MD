@@ -42,8 +42,8 @@ Takes a folder of Obsidian-style `.md` notes — one per vulnerability — analy
 Each `.md` is an auditor's raw note. Images are referenced inline using Obsidian syntax (`![[image.png]]`) and must sit in the same folder as the note. The script:
 
 1. Parses each note and extracts embedded image references
-2. **Searches the knowledge base** (`-e vulnerabilities.yml`) for the write-ups closest to the note
-3. Calls the AI to generate structured vulnerability JSON (title, description, observation, remediation, CVSS, etc.), **reusing the matching knowledge base entry literally** when there is one
+2. **Searches the knowledge base** for the write-ups closest to the note — only when `-e` is given
+3. Calls the AI to generate structured vulnerability JSON (title, description, observation, affected assets, remediation, CVSS, etc.), **reusing the matching knowledge base entry literally** when there is one
 4. Calls the AI again per image to generate a technical description and caption
 5. Uploads images to PwnDoc and assembles the `poc` field with descriptions + inline images + `alt` captions
 6. Pushes the finding to the selected (or newly created) audit
@@ -54,8 +54,20 @@ Each `.md` is an auditor's raw note. Images are referenced inline using Obsidian
 |---|---|
 | `description` | Theoretical explanation of the vulnerability class — how it works, why it exists, generic attack scenario. No client names, hosts, URLs or engagement-specific evidence. |
 | `observation` | Impact of this specific finding, explicitly covering **confidentiality**, **integrity** and **availability**. If a property is not affected, that is stated too. |
+| `affectedAssets` | The assets where the finding was confirmed, read from the note **and the screenshots**. Goes into PwnDoc's `scope` field, one asset per line. |
 
 These semantics apply to text the AI writes itself. When a knowledge base entry matches, its text wins and is copied as-is — see [Knowledge base](#knowledge-base--e).
+
+### Affected assets
+
+Extracted from what is actually visible in the evidence — the main AI call receives the screenshots, so a host in a Burp `Host:` header or an `-dc-ip` argument in a terminal capture is picked up. One line per asset, normalised to a fixed shape and nothing else — no paths, no query strings, no commentary:
+
+| Asset | Format | Example |
+|---|---|---|
+| Web | `scheme://host:port` | `https://app.example.com:443` |
+| Anything else | `host:port` | `10.10.10.192:88` |
+
+`host` is the IP or domain exactly as it appears in the evidence. The port is always stated; when it is not visible, the service default is used (`80`, `443`, `22`, `445`, `389`, `636`, `3389`, `1433`, `3306`). Assets are never invented and never copied from a knowledge base entry — it is the one field always written from this engagement's evidence. Duplicates are removed, and the result is uploaded as `<p>asset</p>` per line, matching how past reports fill the field.
 
 ---
 
@@ -131,7 +143,9 @@ llm:
 
 ## Knowledge base (`-e`)
 
-The `.yml` passed with `-e` is not just a style sample — it is the **source of truth for the wording**. For every note the script ranks the whole file and injects the closest entries into the prompt, with a hard instruction: *if one of them covers the same vulnerability, copy `description`, `observation`, `remediation`, `references`, `cvssv3`, `vulnType`, `priority` and `remediationComplexity` character for character, HTML included*. Only details contradicted by the note (versions, ports, affected components) may be adapted; everything else stays byte-identical, so the report keeps the exact terminology the team already agreed on.
+**Optional.** Without `-e` the script runs exactly the same, but there is nothing to reuse: every finding is written from scratch, in the neutral register of a professional pentest report, and the wording will not match your past reports. The run starts with a warning saying so. Use this mode for a first audit, or when you don't have an export at hand.
+
+With `-e`, the `.yml` is not just a style sample — it is the **source of truth for the wording**. For every note the script ranks the whole file and injects the closest entries into the prompt, with a hard instruction: *if one of them covers the same vulnerability, copy `description`, `observation`, `remediation`, `references`, `cvssv3`, `vulnType`, `priority` and `remediationComplexity` character for character, HTML included*. Only details contradicted by the note (versions, ports, affected components) may be adapted; everything else stays byte-identical, so the report keeps the exact terminology the team already agreed on.
 
 A note about *"TLS 1.0 and 1.1 still enabled, RC4 and 3DES accepted"* therefore comes back written with the existing **"Algoritmos de cifrado SSL/TLS obsoletos"** text, not with a fresh paraphrase. Only when nothing in the file matches does the AI write from scratch, imitating the tone, vocabulary and HTML structure of the entries it was shown. The console prints which entry was reused (`reused KB entry: …`) or warns that the finding was `written from scratch`.
 
@@ -193,7 +207,7 @@ Each note prints its candidates with their score and title overlap, so you can s
 
 ```bash
 # Run from the project root
-python ai-pwndoc.py <audit-folder> -e vulnerabilities.yml [options]
+python ai-pwndoc.py <audit-folder> [-e vulnerabilities.yml] [options]
 ```
 
 ### Arguments
@@ -201,8 +215,8 @@ python ai-pwndoc.py <audit-folder> -e vulnerabilities.yml [options]
 | Argument | Short | Description |
 |---|---|---|
 | `folder` | | Folder containing `.md` notes |
-| `--examples` | `-e` | `.yml` knowledge base of past vulnerabilities (**required**) — matching entries are reused literally |
-| `--matches` | `-k` | Max knowledge base entries injected per note (default: `4`) |
+| `--examples` | `-e` | `.yml` knowledge base of past vulnerabilities — matching entries are reused literally. Optional: without it everything is written from scratch |
+| `--matches` | `-k` | Max knowledge base entries injected per note (default: `4`). Ignored without `-e` |
 | `--provider` | `-p` | AI provider: `claude`, `claude-code` or `gemini` (overrides config) |
 | `--model` | `-m` | Model override (overrides config). `claude`: full model id (e.g. `claude-opus-4-5`). `claude-code`: id or alias (`opus`, `sonnet`, `haiku`) |
 | `--config` | `-c` | Path to config file (default: `config.yml`) |
@@ -212,9 +226,31 @@ python ai-pwndoc.py <audit-folder> -e vulnerabilities.yml [options]
 | `--dry-run` | | Run the full AI pipeline but do not upload to PwnDoc |
 | `--no-images` | | Skip image analysis and upload |
 
+### Writing a section by hand
+
+Every section the AI writes can be turned off. The flag drops that field from the prompt entirely — the AI is never asked for it, so it costs no tokens and cannot invent it — and the field is left out of the upload, so PwnDoc shows it empty for you to fill in.
+
+| Flag | Skips |
+|---|---|
+| `--no-description` | `description` |
+| `--no-observation` | `observation` |
+| `--no-affected-assets` | `affectedAssets` |
+| `--no-remediation` | `remediation` |
+| `--no-references` | `references` |
+| `--no-cvss` | `cvssv3` |
+| `--no-vuln-type` | `vulnType` |
+| `--no-priority` | `priority` |
+| `--no-complexity` | `remediationComplexity` |
+| `--no-evidence` | The evidence narrative and captions — images are still uploaded |
+
+`--no-evidence` and `--no-images` are different: the first keeps the screenshots in the report but leaves the write-up to you, the second drops the screenshots altogether. The title is always generated, since it identifies the finding.
+
 ### Examples
 
 ```bash
+# No knowledge base — every finding written from scratch
+python ai-pwndoc.py SampleAudits/WebAudit/
+
 # Basic run — interactive audit selection (or create a new audit with 'n')
 python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml
 
@@ -232,6 +268,10 @@ python ai-pwndoc.py SampleAudits/ADPentest/ -e vulnerabilities.yml --model claud
 
 # Show the AI more knowledge base candidates per note
 python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml -k 6
+
+# Let the AI draft everything except the scoring and the affected assets
+python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml \
+  --no-affected-assets --no-cvss --no-priority
 
 # Inject extra instructions into the prompt
 python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml --instructions "Always include the CWE identifier in the description."

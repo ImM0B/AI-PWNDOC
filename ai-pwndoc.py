@@ -15,7 +15,7 @@ import subprocess
 import sys
 import unicodedata
 from collections import Counter
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 
 import requests
@@ -156,6 +156,24 @@ def _as_list(value) -> list:
     if isinstance(value, (list, tuple)):
         return [str(v) for v in value if v]
     return [str(value)]
+
+
+def normalize_assets(value) -> list:
+    """One asset per line, de-duplicated, order preserved — accepts a list or a newline blob."""
+    if isinstance(value, str):
+        value = re.split(r"[\r\n]+", value)
+    items, seen = [], set()
+    for raw in _as_list(value):
+        asset = strip_html(raw).strip().strip(",;")
+        if asset and asset not in seen:
+            seen.add(asset)
+            items.append(asset)
+    return items
+
+
+def assets_to_scope_html(assets: list) -> str:
+    """PwnDoc's `scope` field is HTML — past reports use one <p> per asset."""
+    return "".join(f"<p>{escape(a)}</p>" for a in assets)
 
 
 def _flatten_entry(vuln: dict, detail: dict) -> dict:
@@ -353,12 +371,80 @@ def matches_to_prompt(matches: list) -> str:
 # PROMPTS
 # ──────────────────────────────────────────────
 
-VULN_FIELDS = [
-    "title", "vulnType", "description", "observation",
-    "remediation", "remediationComplexity", "priority", "references", "cvssv3",
+# Everything the AI writes, in report order. Each one can be turned off with its flag so the
+# auditor writes that section by hand — a disabled field is never asked for and never uploaded.
+GENERATED_FIELDS = [
+    # key,                    cli flag,               argparse dest
+    ("vulnType",              "--no-vuln-type",       "no_vuln_type"),
+    ("description",           "--no-description",     "no_description"),
+    ("observation",           "--no-observation",     "no_observation"),
+    ("affectedAssets",        "--no-affected-assets", "no_affected_assets"),
+    ("remediation",           "--no-remediation",     "no_remediation"),
+    ("remediationComplexity", "--no-complexity",      "no_complexity"),
+    ("priority",              "--no-priority",        "no_priority"),
+    ("references",            "--no-references",      "no_references"),
+    ("cvssv3",                "--no-cvss",            "no_cvss"),
 ]
 
-SYSTEM_PROMPT_TEMPLATE = """You are a cybersecurity expert specialised in writing professional penetration testing reports.
+# Affected assets are specific to this engagement, so they are the one field that is always written
+# from the note and never copied from the knowledge base.
+NON_REUSABLE_FIELDS = {"affectedAssets"}
+
+FIELD_RULES = {
+    "vulnType": '- "vulnType": category (e.g. "Web", "Network", "Active Directory", etc.)',
+    "description": (
+        '- "description": theoretical explanation of what the vulnerability class is — how it works,\n'
+        '  why it exists and the general attack scenario. Generic and technology-agnostic: NO client\n'
+        '  names, NO specific hosts, URLs, IPs or evidence from this engagement.'
+    ),
+    "observation": (
+        '- "observation": impact analysis for this specific finding, explicitly covering the three\n'
+        '  security properties — confidentiality, integrity and availability. State for each one\n'
+        '  whether it is affected and how; if a property is not affected, say so briefly and why.'
+    ),
+    "affectedAssets": (
+        '- "affectedAssets": the assets where this finding was actually confirmed, read from the\n'
+        '  auditor\'s note AND the evidence screenshots. A list of strings, one asset per string,\n'
+        '  and nothing else — no prose, no bullets, no comments, no duplicates.\n'
+        '  * Web asset:  scheme://host:port   e.g. "https://10.0.0.5:8443", "http://app.example.com:80"\n'
+        '  * Any other:  host:port            e.g. "10.0.0.5:445", "dc01.corp.local:389"\n'
+        '  * `host` is the IP or the domain exactly as it appears in the evidence. Nothing else:\n'
+        '    no path, no query string, no trailing slash, no description of the asset.\n'
+        '  * Always state the port. If it is not visible, use the service default (80 http,\n'
+        '    443 https, 22 ssh, 445 smb, 389 ldap, 636 ldaps, 3389 rdp, 1433 mssql, 3306 mysql).\n'
+        '  * NEVER invent an asset and NEVER take one from a knowledge base entry — only assets\n'
+        '    actually visible in this note or its screenshots. If none can be determined, use [].'
+    ),
+    "remediation": '- "remediation" must be concise and actionable.',
+    "remediationComplexity": '- "remediationComplexity": 1 (Easy), 2 (Medium), 3 (Hard)',
+    "priority": '- "priority": 1 (Low), 2 (Medium), 3 (High), 4 (Critical)',
+    "references": '- "references" must be a list of strings with relevant URLs.',
+    "cvssv3": '- "cvssv3": CVSS 3.x vector if applicable, otherwise null.',
+}
+
+# Rules that name the knowledge base need a variant for runs without one.
+FIELD_RULES_NO_KB = {
+    "affectedAssets": FIELD_RULES["affectedAssets"].replace(
+        '  * NEVER invent an asset and NEVER take one from a knowledge base entry — only assets\n'
+        '    actually visible in this note or its screenshots. If none can be determined, use [].',
+        '  * NEVER invent an asset — only assets actually visible in this note or its screenshots.\n'
+        '    If none can be determined, use [].',
+    ),
+}
+
+JSON_LINES = {
+    "vulnType":              '"vulnType": "..."',
+    "description":           '"description": "..."',
+    "observation":           '"observation": "..."',
+    "affectedAssets":        '"affectedAssets": ["https://10.0.0.5:8443", "10.0.0.5:445"]',
+    "remediation":           '"remediation": "..."',
+    "remediationComplexity": '"remediationComplexity": 2',
+    "priority":              '"priority": 3',
+    "references":            '"references": ["..."]',
+    "cvssv3":                '"cvssv3": "..."',
+}
+
+SYSTEM_PROMPT_INTRO_KB = """You are a cybersecurity expert specialised in writing professional penetration testing reports.
 You write findings for an audit team that already has a knowledge base (KB) of vulnerabilities
 written by them in past reports. The user message contains the auditor's raw note for a new finding
 plus the KB entries closest to that note.
@@ -370,9 +456,8 @@ REUSE POLICY — this is the most important rule, apply it before anything else:
    underlying technical issue, not by wording: a note about "TLS 1.0 and 1.1 still enabled" matches a
    KB entry about "obsolete SSL/TLS protocols and weak ciphers"; a note about Kerberoasting matches a
    KB entry about Kerberos service ticket cracking, and so on.
-2. If one matches, REUSE IT LITERALLY. Copy "description", "observation", "remediation",
-   "references", "cvssv3", "vulnType", "priority" and "remediationComplexity" character for
-   character, keeping the exact same HTML markup, wording, punctuation and entities (&nbsp; etc.).
+2. If one matches, REUSE IT LITERALLY. Copy {reuse_fields} character for character, keeping the
+   exact same HTML markup, wording, punctuation and entities (&nbsp; etc.).
    Do NOT paraphrase, do NOT reorder, do NOT translate, do NOT "improve" or expand the text.
    - "title": keep the KB title as-is unless the note covers a clearly different scope.
    - Only exception: if a concrete detail of the KB text contradicts the note (for example it lists
@@ -394,33 +479,67 @@ FORMAT:
 - Do NOT include images/evidence in the JSON; those are handled separately.
 
 FIELD SEMANTICS (apply when you write a field yourself — never rewrite copied KB text to fit them):
-- "description": theoretical explanation of what the vulnerability class is — how it works, why it
-  exists and the general attack scenario. Generic and technology-agnostic: NO client names, NO
-  specific hosts, URLs, IPs or evidence from this engagement.
-- "observation": impact analysis for this specific finding, explicitly covering the three security
-  properties — confidentiality, integrity and availability. State for each one whether it is
-  affected and how; if a property is not affected, say so briefly and why.
-- "remediation" must be concise and actionable.
-- "references" must be a list of strings with relevant URLs.
-- "remediationComplexity": 1 (Easy), 2 (Medium), 3 (Hard)
-- "priority": 1 (Low), 2 (Medium), 3 (High), 4 (Critical)
-- "cvssv3": CVSS 3.x vector if applicable, otherwise null.
-- "vulnType": category (e.g. "Web", "Network", "Active Directory", etc.)
+"""
+
+SYSTEM_PROMPT_INTRO_SOLO = """You are a cybersecurity expert specialised in writing professional penetration testing reports.
+Analyse the auditor's raw note for a new finding, together with its evidence screenshots, and write
+the report content for it.
+
+OUTPUT LANGUAGE: {lang_instruction}
+
+There is no knowledge base for this run, so there is no house style to copy: write in the neutral,
+factual register of a professional penetration test report. Full sentences, no marketing language,
+no hedging, no first person. Consistency across notes matters — same structure and same level of
+detail for every finding.
+
+FORMAT:
+- Reply ONLY with valid JSON — no markdown fences, no extra explanations.
+- "description", "observation" and "remediation" are HTML fragments (<p>, <ul>, <li>, <code>,
+  <strong>) — PwnDoc renders them as rich text, so never send plain text.
+- ALL text must be written in the output language specified above.
+- Use null for any field you don't have enough information for.
+- Do NOT include images/evidence in the JSON; those are handled separately.
+
+FIELD SEMANTICS:
+"""
+
+SYSTEM_PROMPT_TAIL = """{field_rules}
+
+Emit EXACTLY the keys listed below and no others. Any field not listed is written by the auditor by
+hand: do not produce it, do not mention it and do not fold its content into another field.
 {extra_instructions}
 Reply with exactly this JSON:
 {{
-  "basedOn": "exact KB title reused, or null",
-  "title": "...",
-  "vulnType": "...",
-  "description": "...",
-  "observation": "...",
-  "remediation": "...",
-  "remediationComplexity": 2,
-  "priority": 3,
-  "references": ["..."],
-  "cvssv3": "..."
+  {json_template}
 }}
 """
+
+
+def build_system_prompt(lang_instruction: str, extra_instructions: str, fields: list,
+                        has_kb: bool) -> str:
+    """Ask only for the fields still enabled — a skipped one costs no tokens and no hallucination.
+
+    Without a knowledge base every instruction that points at one is dropped rather than left
+    dangling: no reuse policy, no "copy it verbatim", no "basedOn".
+    """
+    if has_kb:
+        reusable = [f for f in fields if f not in NON_REUSABLE_FIELDS]
+        intro = SYSTEM_PROMPT_INTRO_KB.format(
+            lang_instruction=lang_instruction,
+            reuse_fields=", ".join(f'"{f}"' for f in reusable) or "(nothing — all fields are manual)",
+        )
+        json_lines = ['"basedOn": "exact KB title reused, or null"', '"title": "..."']
+    else:
+        intro = SYSTEM_PROMPT_INTRO_SOLO.format(lang_instruction=lang_instruction)
+        json_lines = ['"title": "..."']
+
+    rules = FIELD_RULES if has_kb else {**FIELD_RULES, **FIELD_RULES_NO_KB}
+    json_lines += [JSON_LINES[f] for f in fields]
+    return intro + SYSTEM_PROMPT_TAIL.format(
+        extra_instructions=extra_instructions,
+        field_rules="\n".join(rules[f] for f in fields),
+        json_template=",\n  ".join(json_lines),
+    )
 
 EVIDENCE_ANALYSIS_SYSTEM_PROMPT = """You are a cybersecurity expert specialised in writing professional penetration testing reports.
 You are given the vulnerability context and ALL the evidence screenshots for a single finding.
@@ -446,7 +565,15 @@ Reply ONLY with valid JSON in exactly this format — no markdown, no explanatio
 }}
 """
 
-USER_PROMPT_TEMPLATE = """KNOWLEDGE BASE — entries from past reports that are closest to this note.
+USER_PROMPT_TEMPLATE_SOLO = """AUDITOR'S NOTE ({note_name}):
+
+{notes}
+
+Available evidence images ({n_images}): {image_list}
+
+Generate the vulnerability JSON following the system instructions."""
+
+USER_PROMPT_TEMPLATE_KB = """KNOWLEDGE BASE — entries from past reports that are closest to this note.
 They are ordered by relevance; relevance alone does not mean they match, judge that yourself.
 If one of them covers the same vulnerability, copy its fields literally as instructed.
 
@@ -694,6 +821,7 @@ FIELD_LABELS = {
     "vulnType":              "Type",
     "description":           "Description",
     "observation":           "Observation",
+    "affectedAssets":        "Assets",
     "remediation":           "Remediation",
     "remediationComplexity": "Complexity",
     "priority":              "Priority",
@@ -705,16 +833,20 @@ PRIORITY_MAP    = {1: "Low", 2: "Medium", 3: "High", 4: "Critical"}
 COMPLEXITY_MAP  = {1: "Easy", 2: "Medium", 3: "Hard"}
 
 
-def print_vuln(vuln: dict, md_name: str) -> None:
+def print_vuln(vuln: dict, md_name: str, fields: list) -> None:
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column(style="dim cyan", width=14)
     table.add_column(style="white")
     for field, label in FIELD_LABELS.items():
+        if field != "title" and field not in fields:
+            continue
         val = vuln.get(field, "")
         if field == "priority":
             display = f"{val} ({PRIORITY_MAP.get(val, '')})"
         elif field == "remediationComplexity":
             display = f"{val} ({COMPLEXITY_MAP.get(val, '')})"
+        elif field == "affectedAssets":
+            display = "\n".join(normalize_assets(val)) or "[dim]-[/dim]"
         elif isinstance(val, list):
             display = ", ".join(str(v) for v in val)
         else:
@@ -795,7 +927,8 @@ class PwnDocAPI:
         return image_id
 
     def add_finding(self, audit_id: str, vuln_data: dict, evidence_html: str,
-                    captions: list, image_ids: list, proofs_header: str) -> dict:
+                    captions: list, image_ids: list, proofs_header: str,
+                    fields: list) -> dict:
         poc_parts = [proofs_header]
         if evidence_html:
             poc_parts.append(evidence_html)
@@ -807,19 +940,27 @@ class PwnDocAPI:
                 poc_parts.append(f'<p><img src="{img_id}"></p>')
 
         body = {
-            "title":                 vuln_data.get("title", ""),
-            "vulnType":              vuln_data.get("vulnType", ""),
-            "description":           vuln_data.get("description", ""),
-            "observation":           vuln_data.get("observation", ""),
-            "remediation":           vuln_data.get("remediation", ""),
-            "remediationComplexity": vuln_data.get("remediationComplexity", 2),
-            "priority":              vuln_data.get("priority", 2),
-            "references":            vuln_data.get("references", []),
-            "cvssv3":                vuln_data.get("cvssv3", "") or "",
-            "poc":                   "\n".join(poc_parts),
-            "category":              None,
-            "customFields":          [],
+            "title":        vuln_data.get("title", ""),
+            "poc":          "\n".join(poc_parts),
+            "category":     None,
+            "customFields": [],
         }
+        # A field the auditor opted out of is left untouched so PwnDoc shows it empty to fill in.
+        defaults = {
+            "vulnType":              "",
+            "description":           "",
+            "observation":           "",
+            "remediation":           "",
+            "remediationComplexity": 2,
+            "priority":              2,
+            "references":            [],
+            "cvssv3":                "",
+        }
+        for field in fields:
+            if field == "affectedAssets":
+                body["scope"] = assets_to_scope_html(normalize_assets(vuln_data.get("affectedAssets")))
+            else:
+                body[field] = vuln_data.get(field) or defaults[field]
         resp = self.session.post(
             f"{self.base_url}/api/audits/{audit_id}/findings",
             json=body, verify=self.verify_ssl, timeout=30,
@@ -905,8 +1046,10 @@ def process_md_file(
     audit_id: str,
     dry_run: bool,
     no_images: bool,
+    no_evidence: bool,
     index: "VulnIndex",
     n_matches: int,
+    fields: list,
 ) -> bool:  # extra_instructions injected into system_prompt before call
     name = Path(md_file).name
     console.print(f"\n  ●  [bold cyan]{name}[/bold cyan]")
@@ -920,31 +1063,36 @@ def process_md_file(
 
     # Retrieve the closest past write-ups. Filename and markdown headings name the finding, so they
     # drive the query; the body only refines it.
-    headings = re.findall(r"^#{1,6}\s+(.+)$", md_data["clean_text"], re.MULTILINE)
-    matches = index.search(
-        md_data["clean_text"],
-        k=n_matches,
-        title=" ".join([Path(md_file).stem] + headings),
-    )
-    if matches:
-        console.print(f"  ○  [dim]KB matches:[/dim]")
-        for m in matches:
-            console.print(
-                f"  ◌  [dim]{m['score']:6.1f}[/dim]  "
-                f"[dim]({m['title_overlap']:.0%} title)[/dim]  {m['entry']['title']}"
-            )
-    else:
-        console.print("  ○  [yellow]no KB match — writing from scratch[/yellow]")
+    matches = []
+    if index is not None:
+        headings = re.findall(r"^#{1,6}\s+(.+)$", md_data["clean_text"], re.MULTILINE)
+        matches = index.search(
+            md_data["clean_text"],
+            k=n_matches,
+            title=" ".join([Path(md_file).stem] + headings),
+        )
+        if matches:
+            console.print(f"  ○  [dim]KB matches:[/dim]")
+            for m in matches:
+                console.print(
+                    f"  ◌  [dim]{m['score']:6.1f}[/dim]  "
+                    f"[dim]({m['title_overlap']:.0%} title)[/dim]  {m['entry']['title']}"
+                )
+        else:
+            console.print("  ○  [yellow]no KB match — writing from scratch[/yellow]")
 
     # Query AI
     image_list  = [Path(i).name for i in images] if images else ["none"]
-    user_prompt = USER_PROMPT_TEMPLATE.format(
-        kb_entries=matches_to_prompt(matches),
-        note_name=name,
-        notes=md_data["clean_text"],
-        n_images=len(images),
-        image_list=", ".join(image_list),
-    )
+    common = {
+        "note_name":  name,
+        "notes":      md_data["clean_text"],
+        "n_images":   len(images),
+        "image_list": ", ".join(image_list),
+    }
+    if index is not None:
+        user_prompt = USER_PROMPT_TEMPLATE_KB.format(kb_entries=matches_to_prompt(matches), **common)
+    else:
+        user_prompt = USER_PROMPT_TEMPLATE_SOLO.format(**common)
     cfg["_md_path"] = md_file
 
     with console.status(f"  ◎  querying {provider}..."):
@@ -961,23 +1109,28 @@ def process_md_file(
         return False
 
     # Display result
-    based_on = vuln.get("basedOn")
-    if based_on:
-        console.print(f"  ○  [green]reused KB entry:[/green] [bold]{based_on}[/bold]")
-    else:
-        console.print("  ○  [yellow]written from scratch (no KB entry reused)[/yellow]")
-    print_vuln(vuln, name)
+    if index is not None:
+        based_on = vuln.get("basedOn")
+        if based_on:
+            console.print(f"  ○  [green]reused KB entry:[/green] [bold]{based_on}[/bold]")
+        else:
+            console.print("  ○  [yellow]written from scratch (no KB entry reused)[/yellow]")
+    print_vuln(vuln, name, fields)
 
     # Analyse evidence (single cohesive narrative + one caption per image)
     evidence_html = ""
     captions = []
     if images and not no_images:
-        with console.status(f"  ◎  writing evidence from {len(images)} image(s)..."):
-            evidence = analyze_evidence(provider, images, vuln, lang_instruction, cfg)
-        evidence_html = evidence["evidence"]
-        captions = evidence["captions"]
-        for img, cap in zip(images, captions):
-            console.print(f"  ◌  [dim]{Path(img).name}[/dim]  [dim italic]{cap}[/dim italic]")
+        if no_evidence:
+            # Images still go in, but the narrative and captions are the auditor's job.
+            captions = [_fallback_caption(p) for p in images]
+        else:
+            with console.status(f"  ◎  writing evidence from {len(images)} image(s)..."):
+                evidence = analyze_evidence(provider, images, vuln, lang_instruction, cfg)
+            evidence_html = evidence["evidence"]
+            captions = evidence["captions"]
+            for img, cap in zip(images, captions):
+                console.print(f"  ◌  [dim]{Path(img).name}[/dim]  [dim italic]{cap}[/dim italic]")
 
     if dry_run:
         return True
@@ -994,7 +1147,8 @@ def process_md_file(
 
     # Add finding
     try:
-        api.add_finding(audit_id, vuln, evidence_html, captions[:len(image_ids)], image_ids, proofs_header)
+        api.add_finding(audit_id, vuln, evidence_html, captions[:len(image_ids)], image_ids,
+                        proofs_header, fields)
         console.print(f"  ●  [green]added[/green]  [bold]{vuln.get('title', name)}[/bold]")
         return True
     except Exception as e:
@@ -1012,25 +1166,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python ai-pwndoc.py Audit1/ -e examples.yml
+  python ai-pwndoc.py Audit1/                                                  # no KB: written from scratch
+  python ai-pwndoc.py Audit1/ -e examples.yml                                  # reuses matching write-ups
   python ai-pwndoc.py Audit1/ -e examples.yml --provider gemini --lang en
   python ai-pwndoc.py Audit1/ -e examples.yml --provider claude-code          # uses Claude Code subscription
   python ai-pwndoc.py Audit1/ -e examples.yml --provider claude-code -m opus
   python ai-pwndoc.py Audit1/ -e examples.yml --model claude-opus-4-5
   python ai-pwndoc.py Audit1/ -e examples.yml -k 6                             # more KB candidates per note
+  python ai-pwndoc.py Audit1/ -e examples.yml --no-affected-assets --no-cvss   # write those by hand
   python ai-pwndoc.py Audit1/ -e examples.yml --instructions "Always include CWE identifier"
   python ai-pwndoc.py Audit1/ -e examples.yml --audit-id abc123 --dry-run
         """,
     )
     parser.add_argument("folder",            help="Folder containing Obsidian .md notes")
-    parser.add_argument("--examples", "-e",  required=True,
-                        help="PwnDoc vulnerabilities .yml used as knowledge base. Entries matching "
-                             "the note are reused literally (description, observation, remediation, "
-                             "CVSS...); the rest only set the writing style")
+    parser.add_argument("--examples", "-e",  default=None,
+                        help="Optional PwnDoc vulnerabilities .yml used as knowledge base. Entries "
+                             "matching the note are reused literally (description, observation, "
+                             "remediation, CVSS...); the rest only set the writing style. Without "
+                             "it every finding is written from scratch")
     parser.add_argument("--matches", "-k",   type=int, default=4,
                         help="Max KB entries injected into the prompt per note (default: 4). "
                              "Entries scoring below 30%% of the best match are dropped, so a clear "
-                             "winner is sent alone")
+                             "winner is sent alone. Ignored without --examples")
     parser.add_argument("--provider", "-p",  choices=["claude", "claude-code", "gemini"],
                         default=None,        help="AI provider (overrides config). "
                                                   "claude = Anthropic API key | "
@@ -1046,8 +1203,20 @@ Examples:
     parser.add_argument("--instructions",    default=None,
                         help="Additional instructions injected into the system prompt")
     parser.add_argument("--dry-run",         action="store_true", help="Do not upload to PwnDoc")
-    parser.add_argument("--no-images",       action="store_true", help="Skip image upload")
+    parser.add_argument("--no-images",       action="store_true", help="Skip image analysis and upload")
+
+    skip = parser.add_argument_group(
+        "sections to write by hand",
+        "Each flag drops that section from the prompt: the AI never writes it and PwnDoc is left "
+        "with it empty for you to fill in",
+    )
+    skip.add_argument("--no-evidence", action="store_true",
+                      help="Do not write the evidence narrative or captions (images are still uploaded)")
+    for key, flag, dest in GENERATED_FIELDS:
+        skip.add_argument(flag, dest=dest, action="store_true", help=f"Do not write {key}")
+
     args = parser.parse_args()
+    fields = [key for key, _flag, dest in GENERATED_FIELDS if not getattr(args, dest)]
 
     console.print(Panel.fit(
         "[bold red]AI-PWNDOC[/bold red]  [dim]automated vulnerability writing[/dim]",
@@ -1086,28 +1255,35 @@ Examples:
         border_style="cyan",
     ))
 
-    # Load the knowledge base and build the retrieval index
-    try:
-        kb_entries = load_kb_entries(args.examples)
-    except Exception as e:
-        console.print(f"[red]✗ Could not load '{args.examples}': {e}[/red]")
-        sys.exit(1)
-    if not kb_entries:
-        console.print(f"[red]✗ No vulnerabilities found in '{args.examples}'.[/red]")
-        sys.exit(1)
+    # Load the knowledge base and build the retrieval index — optional, the script runs without one
+    index = None
+    if args.examples:
+        try:
+            kb_entries = load_kb_entries(args.examples)
+        except Exception as e:
+            console.print(f"[red]✗ Could not load '{args.examples}': {e}[/red]")
+            sys.exit(1)
+        if not kb_entries:
+            console.print(f"[red]✗ No vulnerabilities found in '{args.examples}'.[/red]")
+            sys.exit(1)
 
-    total_entries = len(kb_entries)
-    kb_entries, fallback = filter_by_locale(kb_entries, args.lang)
-    if fallback:
+        total_entries = len(kb_entries)
+        kb_entries, fallback = filter_by_locale(kb_entries, args.lang)
+        if fallback:
+            console.print(
+                f"[yellow]⚠ Fewer than 5 entries in locale '{args.lang}' — using all locales; "
+                f"reused text may not be in the output language.[/yellow]"
+            )
+        index = VulnIndex(kb_entries)
         console.print(
-            f"[yellow]⚠ Fewer than 5 entries in locale '{args.lang}' — using all locales; "
-            f"reused text may not be in the output language.[/yellow]"
+            f"[dim]KB: {len(kb_entries)}/{total_entries} entr(y/ies) from {args.examples}"
+            f"  |  top {args.matches} injected per note[/dim]"
         )
-    index = VulnIndex(kb_entries)
-    console.print(
-        f"[dim]KB: {len(kb_entries)}/{total_entries} entr(y/ies) from {args.examples}"
-        f"  |  top {args.matches} injected per note[/dim]"
-    )
+    else:
+        console.print(
+            "[yellow]⚠ No knowledge base (-e): nothing to reuse, so every finding is written from "
+            "scratch and the wording will not match your past reports.[/yellow]"
+        )
 
     # Build shared system prompt
     if args.lang == "en":
@@ -1121,10 +1297,17 @@ Examples:
     if args.instructions:
         extra_block = f"\nADDITIONAL INSTRUCTIONS:\n{args.instructions}\n"
 
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        lang_instruction=lang_instruction,
-        extra_instructions=extra_block,
-    )
+    system_prompt = build_system_prompt(lang_instruction, extra_block, fields,
+                                        has_kb=index is not None)
+
+    skipped = [key for key, _flag, dest in GENERATED_FIELDS if getattr(args, dest)]
+    if args.no_evidence:
+        skipped.append("evidence")
+    if skipped:
+        console.print(f"[dim]written by hand (AI skips): {', '.join(skipped)}[/dim]")
+    if not fields:
+        console.print("[yellow]⚠ Every field is disabled — only the title and the evidence will be "
+                      "generated.[/yellow]")
 
     # Connect to PwnDoc (once)
     api      = None
@@ -1158,8 +1341,10 @@ Examples:
             audit_id=audit_id,
             dry_run=args.dry_run,
             no_images=args.no_images,
+            no_evidence=args.no_evidence,
             index=index,
             n_matches=args.matches,
+            fields=fields,
         )
         (ok if success else fail).append(md_file.name)
 
