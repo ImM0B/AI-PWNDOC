@@ -7,11 +7,15 @@ Supports: Claude API, Claude Code CLI (subscription), Gemini CLI
 import argparse
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
 import subprocess
 import sys
+import unicodedata
+from collections import Counter
+from html import unescape
 from pathlib import Path
 
 import requests
@@ -106,26 +110,241 @@ def parse_obsidian_md(md_path: str) -> dict:
 
 
 # ──────────────────────────────────────────────
-# EXAMPLES LOADER
+# KNOWLEDGE BASE (vulnerabilities.yml → searchable entries)
 # ──────────────────────────────────────────────
 
-def load_vuln_examples(yml_path: str) -> list:
-    with open(yml_path) as f:
+_TAG_RE  = re.compile(r"<[^>]+>")
+_WS_RE   = re.compile(r"\s+")
+_TOKEN_RE = re.compile(r"[a-z0-9]+(?:[.\-_/][a-z0-9]+)*")
+
+# Words that carry no discriminating power when matching a note against the KB.
+STOPWORDS = {
+    # es
+    "los", "las", "una", "unos", "unas", "del", "que", "con", "por", "para", "como", "este", "esta",
+    "estos", "estas", "ese", "esa", "sus", "les", "más", "mas", "muy", "sin", "sobre", "entre",
+    "todo", "toda", "todos", "todas", "puede", "pueden", "podría", "podria", "podrían", "podrian",
+    "ser", "son", "está", "esta", "están", "estan", "hay", "han", "ha", "haber", "sido", "desde",
+    "cuando", "donde", "porque", "pero", "aunque", "también", "tambien", "debe", "deben", "debería",
+    "deberia", "recomienda", "recomendable", "mediante", "través", "traves", "hacia", "cual",
+    "cuales", "otro", "otra", "otros", "otras", "mismo", "misma", "dicha", "dicho", "ello", "esto",
+    # en
+    "the", "and", "for", "with", "this", "that", "these", "those", "from", "into", "your", "you",
+    "are", "was", "were", "has", "have", "had", "not", "but", "can", "could", "would", "should",
+    "which", "when", "where", "there", "their", "them", "then", "than", "also", "such", "will",
+    "may", "might", "must", "any", "all", "its", "it's", "been", "being", "each", "other", "some",
+    # report boilerplate
+    "vulnerabilidad", "vulnerabilidades", "vulnerability", "vulnerabilities", "atacante",
+    "attacker", "sistema", "sistemas", "system", "systems", "auditoria", "auditoría", "audit",
+    "cliente", "client", "servidor", "server", "usuario", "usuarios", "user", "users",
+    "información", "informacion", "information", "nbsp", "http", "https", "www", "com",
+}
+
+KB_TEXT_FIELDS = ("title", "vulnType", "description", "observation", "remediation")
+
+
+def strip_html(value) -> str:
+    """Flatten an HTML field (or list of them) into plain text for indexing."""
+    if isinstance(value, (list, tuple)):
+        value = " ".join(str(v) for v in value)
+    text = unescape(_TAG_RE.sub(" ", str(value or "")))
+    return _WS_RE.sub(" ", text.replace("\xa0", " ")).strip()
+
+
+def _as_list(value) -> list:
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value if v]
+    return [str(value)]
+
+
+def _flatten_entry(vuln: dict, detail: dict) -> dict:
+    """One (vulnerability, locale-detail) pair → one flat KB entry."""
+    return {
+        "title":                 detail.get("title", "") or "",
+        "vulnType":              detail.get("vulnType") or vuln.get("vulnType") or "",
+        "description":           detail.get("description") or "",
+        "observation":           detail.get("observation") or "",
+        "remediation":           detail.get("remediation") or "",
+        "references":            _as_list(detail.get("references") or vuln.get("references")),
+        "cvssv3":                vuln.get("cvssv3") or detail.get("cvssv3") or "",
+        "priority":              vuln.get("priority") or detail.get("priority"),
+        "remediationComplexity": vuln.get("remediationComplexity") or detail.get("remediationComplexity"),
+        "category":              vuln.get("category") or "",
+        "locale":                (detail.get("locale") or "").lower(),
+    }
+
+
+def load_kb_entries(yml_path: str) -> list:
+    """Load a PwnDoc vulnerabilities export (or a flat example list) as KB entries.
+
+    Supports both shapes:
+      - PwnDoc export: [{cvssv3, category, details: [{locale, title, description, ...}]}, ...]
+      - Flat list:     [{title, description, observation, ...}, ...]
+    """
+    with open(yml_path, encoding="utf-8") as f:
         data = yaml.safe_load(f)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "vulnerabilities" in data:
-        return data["vulnerabilities"]
-    return [data]
+
+    if isinstance(data, dict):
+        data = data.get("vulnerabilities", [data])
+    if not isinstance(data, list):
+        data = [data]
+
+    entries = []
+    for vuln in data:
+        if not isinstance(vuln, dict):
+            continue
+        details = vuln.get("details")
+        if isinstance(details, list) and details:
+            for detail in details:
+                if isinstance(detail, dict) and detail.get("title"):
+                    entries.append(_flatten_entry(vuln, detail))
+        elif vuln.get("title"):
+            entries.append(_flatten_entry(vuln, vuln))
+    return entries
 
 
-def examples_to_prompt(examples: list) -> str:
+def filter_by_locale(entries: list, lang: str) -> tuple:
+    """Keep only entries written in the output language — verbatim reuse requires it.
+
+    Returns (entries, used_fallback).
+    """
+    same_lang = [e for e in entries if e["locale"].startswith(lang.lower())]
+    if len(same_lang) >= 5:
+        return same_lang, False
+    return entries, True
+
+
+def tokenize(text: str) -> list:
+    """Lowercase, accent-fold and split, keeping technical tokens like `tls1.2` or `ms17-010`."""
+    folded = unicodedata.normalize("NFKD", str(text).lower())
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+
+    tokens = []
+    for raw in _TOKEN_RE.findall(folded):
+        # `tls1.2` also yields `tls`, `1`, `2` so partial matches still hit.
+        variants = [raw]
+        if any(sep in raw for sep in ".-_/"):
+            variants += [p for p in re.split(r"[.\-_/]", raw) if p]
+        for tok in variants:
+            if len(tok) < 3 or tok in STOPWORDS:
+                continue
+            if tok.isdigit() and len(tok) < 4:
+                continue
+            tokens.append(tok)
+    return tokens
+
+
+class VulnIndex:
+    """BM25 index over the KB so each note is matched against the closest past write-ups."""
+
+    K1 = 1.5
+    B  = 0.75
+    TITLE_BOOST = 3     # KB title tokens weigh 3x — they name the vulnerability class
+    QUERY_TITLE_BOOST = 3   # same on the query side: note filename / headings name the finding
+    QUERY_TF_CAP = 2    # a terminal dump repeating a word 40x must not hijack the ranking
+    REL_CUTOFF  = 0.30  # drop matches below 30% of the best score — noise, not context
+
+    def __init__(self, entries: list):
+        self.entries = entries
+        self.doc_tokens = []
+        self.title_tokens = []
+        df = Counter()
+
+        for entry in entries:
+            title_toks = tokenize(entry["title"])
+            body = " ".join(strip_html(entry.get(f)) for f in KB_TEXT_FIELDS)
+            toks = title_toks * self.TITLE_BOOST + tokenize(body)
+            counts = Counter(toks)
+            self.doc_tokens.append(counts)
+            self.title_tokens.append(set(title_toks))
+            df.update(counts.keys())
+
+        self.n_docs = max(len(entries), 1)
+        self.avg_len = (sum(sum(c.values()) for c in self.doc_tokens) / self.n_docs) or 1.0
+        self.idf = {
+            tok: math.log(1 + (self.n_docs - n + 0.5) / (n + 0.5))
+            for tok, n in df.items()
+        }
+
+    def search(self, body: str, k: int = 4, title: str = "") -> list:
+        """Return the k best matches as [{entry, score, title_overlap}], best first.
+
+        `title` (note filename + headings) is weighted far above the body: the note body is mostly
+        commands, hostnames and evidence, which drown the two or three words that actually name
+        the vulnerability.
+        """
+        if not self.entries:
+            return []
+
+        query = Counter()
+        for tok in tokenize(title):
+            query[tok] += self.QUERY_TITLE_BOOST
+        for tok, tf in Counter(tokenize(body)).items():
+            query[tok] += min(tf, self.QUERY_TF_CAP)
+        if not query:
+            return []
+        query_set = set(query)
+
+        scored = []
+        for i, counts in enumerate(self.doc_tokens):
+            doc_len = sum(counts.values()) or 1
+            score = 0.0
+            for tok, qf in query.items():
+                f = counts.get(tok)
+                if not f:
+                    continue
+                idf = self.idf.get(tok, 0.0)
+                denom = f + self.K1 * (1 - self.B + self.B * doc_len / self.avg_len)
+                score += idf * (f * (self.K1 + 1) / denom) * qf
+            if score <= 0:
+                continue
+            title = self.title_tokens[i]
+            overlap = len(title & query_set) / len(title) if title else 0.0
+            # A note that mentions most of the KB title is almost certainly the same finding.
+            scored.append({
+                "entry": self.entries[i],
+                "score": score * (1 + overlap),
+                "title_overlap": overlap,
+            })
+
+        scored.sort(key=lambda m: m["score"], reverse=True)
+        scored = scored[:k]
+        # The best match sets the bar: anything far below it is noise that only burns tokens.
+        floor = scored[0]["score"] * self.REL_CUTOFF
+        return [m for m in scored if m["score"] >= floor]
+
+
+def _field_block(label: str, value) -> str:
+    if isinstance(value, (list, tuple)):
+        value = "\n".join(f"- {v}" for v in value)
+    return f"{label}:\n{value}"
+
+
+def matches_to_prompt(matches: list) -> str:
+    """Render the retrieved KB entries verbatim (HTML included) so they can be copied as-is."""
+    if not matches:
+        return "(no similar entries found in the knowledge base — write this one from scratch)"
+
     out = []
-    for i, ex in enumerate(examples[:5], 1):
-        out.append(f"=== EXAMPLE {i} ===")
-        for k, v in ex.items():
-            if v:
-                out.append(f"{k}: {v}")
+    for i, match in enumerate(matches, 1):
+        e = match["entry"]
+        out.append(f"=== KB ENTRY {i} (relevance {match['score']:.1f}, "
+                   f"title overlap {match['title_overlap']:.0%}, locale {e['locale'] or '?'}) ===")
+        out.append(_field_block("title", e["title"]))
+        if e["vulnType"]:
+            out.append(_field_block("vulnType", e["vulnType"]))
+        for field in ("description", "observation", "remediation"):
+            if e[field]:
+                out.append(_field_block(field, e[field]))
+        if e["references"]:
+            out.append(_field_block("references", e["references"]))
+        if e["cvssv3"]:
+            out.append(_field_block("cvssv3", e["cvssv3"]))
+        if e["priority"]:
+            out.append(_field_block("priority", e["priority"]))
+        if e["remediationComplexity"]:
+            out.append(_field_block("remediationComplexity", e["remediationComplexity"]))
         out.append("")
     return "\n".join(out)
 
@@ -140,18 +359,41 @@ VULN_FIELDS = [
 ]
 
 SYSTEM_PROMPT_TEMPLATE = """You are a cybersecurity expert specialised in writing professional penetration testing reports.
-Analyse the auditor's notes and generate structured vulnerability content for a professional report.
-
-AUDITOR'S WRITING STYLE (learn from these examples):
-{examples}
+You write findings for an audit team that already has a knowledge base (KB) of vulnerabilities
+written by them in past reports. The user message contains the auditor's raw note for a new finding
+plus the KB entries closest to that note.
 
 OUTPUT LANGUAGE: {lang_instruction}
 
-INSTRUCTIONS:
-- Follow the exact tone, technical level, and structure of the examples.
-- Reply ONLY with valid JSON — no markdown, no extra explanations.
+REUSE POLICY — this is the most important rule, apply it before anything else:
+1. Decide whether any KB entry describes the SAME vulnerability class as the note. Judge by the
+   underlying technical issue, not by wording: a note about "TLS 1.0 and 1.1 still enabled" matches a
+   KB entry about "obsolete SSL/TLS protocols and weak ciphers"; a note about Kerberoasting matches a
+   KB entry about Kerberos service ticket cracking, and so on.
+2. If one matches, REUSE IT LITERALLY. Copy "description", "observation", "remediation",
+   "references", "cvssv3", "vulnType", "priority" and "remediationComplexity" character for
+   character, keeping the exact same HTML markup, wording, punctuation and entities (&nbsp; etc.).
+   Do NOT paraphrase, do NOT reorder, do NOT translate, do NOT "improve" or expand the text.
+   - "title": keep the KB title as-is unless the note covers a clearly different scope.
+   - Only exception: if a concrete detail of the KB text contradicts the note (for example it lists
+     protocol versions, ports, products or affected components that do not match this finding),
+     adapt ONLY that detail — every other sentence stays byte-identical.
+   - Set "basedOn" to the exact title of the KB entry you reused.
+3. If several KB entries match, take the closest one as the base and only pull sentences from the
+   others for aspects the base does not cover, again copied literally.
+4. If no KB entry matches, write the finding from scratch, but imitate the KB: same tone, same
+   technical vocabulary, same HTML structure and same level of detail. Set "basedOn" to null.
+
+FORMAT:
+- Reply ONLY with valid JSON — no markdown fences, no extra explanations.
+- "description", "observation" and "remediation" are HTML fragments, exactly like the KB entries
+  (<p>, <ul>, <li>, <code>, <strong>). Never plain text if the KB uses HTML.
+- ALL text you write yourself must be in the output language specified above. Text copied from a KB
+  entry stays exactly as it is in the KB.
 - Use null for any field you don't have enough information for.
-- ALL text fields must be written in the output language specified above.
+- Do NOT include images/evidence in the JSON; those are handled separately.
+
+FIELD SEMANTICS (apply when you write a field yourself — never rewrite copied KB text to fit them):
 - "description": theoretical explanation of what the vulnerability class is — how it works, why it
   exists and the general attack scenario. Generic and technology-agnostic: NO client names, NO
   specific hosts, URLs, IPs or evidence from this engagement.
@@ -164,10 +406,10 @@ INSTRUCTIONS:
 - "priority": 1 (Low), 2 (Medium), 3 (High), 4 (Critical)
 - "cvssv3": CVSS 3.x vector if applicable, otherwise null.
 - "vulnType": category (e.g. "Web", "Network", "Active Directory", etc.)
-- Do NOT include images/evidence in the JSON; those are handled separately.
 {extra_instructions}
 Reply with exactly this JSON:
 {{
+  "basedOn": "exact KB title reused, or null",
   "title": "...",
   "vulnType": "...",
   "description": "...",
@@ -204,7 +446,13 @@ Reply ONLY with valid JSON in exactly this format — no markdown, no explanatio
 }}
 """
 
-USER_PROMPT_TEMPLATE = """Here are the auditor's notes for this vulnerability:
+USER_PROMPT_TEMPLATE = """KNOWLEDGE BASE — entries from past reports that are closest to this note.
+They are ordered by relevance; relevance alone does not mean they match, judge that yourself.
+If one of them covers the same vulnerability, copy its fields literally as instructed.
+
+{kb_entries}
+
+AUDITOR'S NOTE ({note_name}):
 
 {notes}
 
@@ -657,6 +905,8 @@ def process_md_file(
     audit_id: str,
     dry_run: bool,
     no_images: bool,
+    index: "VulnIndex",
+    n_matches: int,
 ) -> bool:  # extra_instructions injected into system_prompt before call
     name = Path(md_file).name
     console.print(f"\n  ●  [bold cyan]{name}[/bold cyan]")
@@ -668,9 +918,29 @@ def process_md_file(
     for img in images:
         console.print(f"  ◌  [dim]{Path(img).name}[/dim]")
 
+    # Retrieve the closest past write-ups. Filename and markdown headings name the finding, so they
+    # drive the query; the body only refines it.
+    headings = re.findall(r"^#{1,6}\s+(.+)$", md_data["clean_text"], re.MULTILINE)
+    matches = index.search(
+        md_data["clean_text"],
+        k=n_matches,
+        title=" ".join([Path(md_file).stem] + headings),
+    )
+    if matches:
+        console.print(f"  ○  [dim]KB matches:[/dim]")
+        for m in matches:
+            console.print(
+                f"  ◌  [dim]{m['score']:6.1f}[/dim]  "
+                f"[dim]({m['title_overlap']:.0%} title)[/dim]  {m['entry']['title']}"
+            )
+    else:
+        console.print("  ○  [yellow]no KB match — writing from scratch[/yellow]")
+
     # Query AI
     image_list  = [Path(i).name for i in images] if images else ["none"]
     user_prompt = USER_PROMPT_TEMPLATE.format(
+        kb_entries=matches_to_prompt(matches),
+        note_name=name,
         notes=md_data["clean_text"],
         n_images=len(images),
         image_list=", ".join(image_list),
@@ -691,6 +961,11 @@ def process_md_file(
         return False
 
     # Display result
+    based_on = vuln.get("basedOn")
+    if based_on:
+        console.print(f"  ○  [green]reused KB entry:[/green] [bold]{based_on}[/bold]")
+    else:
+        console.print("  ○  [yellow]written from scratch (no KB entry reused)[/yellow]")
     print_vuln(vuln, name)
 
     # Analyse evidence (single cohesive narrative + one caption per image)
@@ -742,12 +1017,20 @@ Examples:
   python ai-pwndoc.py Audit1/ -e examples.yml --provider claude-code          # uses Claude Code subscription
   python ai-pwndoc.py Audit1/ -e examples.yml --provider claude-code -m opus
   python ai-pwndoc.py Audit1/ -e examples.yml --model claude-opus-4-5
+  python ai-pwndoc.py Audit1/ -e examples.yml -k 6                             # more KB candidates per note
   python ai-pwndoc.py Audit1/ -e examples.yml --instructions "Always include CWE identifier"
   python ai-pwndoc.py Audit1/ -e examples.yml --audit-id abc123 --dry-run
         """,
     )
     parser.add_argument("folder",            help="Folder containing Obsidian .md notes")
-    parser.add_argument("--examples", "-e",  required=True, help=".yml file with example vulnerabilities")
+    parser.add_argument("--examples", "-e",  required=True,
+                        help="PwnDoc vulnerabilities .yml used as knowledge base. Entries matching "
+                             "the note are reused literally (description, observation, remediation, "
+                             "CVSS...); the rest only set the writing style")
+    parser.add_argument("--matches", "-k",   type=int, default=4,
+                        help="Max KB entries injected into the prompt per note (default: 4). "
+                             "Entries scoring below 30%% of the best match are dropped, so a clear "
+                             "winner is sent alone")
     parser.add_argument("--provider", "-p",  choices=["claude", "claude-code", "gemini"],
                         default=None,        help="AI provider (overrides config). "
                                                   "claude = Anthropic API key | "
@@ -803,9 +1086,28 @@ Examples:
         border_style="cyan",
     ))
 
-    # Load examples
-    examples = load_vuln_examples(args.examples)
-    console.print(f"[dim]Loaded {len(examples)} example(s) from {args.examples}[/dim]")
+    # Load the knowledge base and build the retrieval index
+    try:
+        kb_entries = load_kb_entries(args.examples)
+    except Exception as e:
+        console.print(f"[red]✗ Could not load '{args.examples}': {e}[/red]")
+        sys.exit(1)
+    if not kb_entries:
+        console.print(f"[red]✗ No vulnerabilities found in '{args.examples}'.[/red]")
+        sys.exit(1)
+
+    total_entries = len(kb_entries)
+    kb_entries, fallback = filter_by_locale(kb_entries, args.lang)
+    if fallback:
+        console.print(
+            f"[yellow]⚠ Fewer than 5 entries in locale '{args.lang}' — using all locales; "
+            f"reused text may not be in the output language.[/yellow]"
+        )
+    index = VulnIndex(kb_entries)
+    console.print(
+        f"[dim]KB: {len(kb_entries)}/{total_entries} entr(y/ies) from {args.examples}"
+        f"  |  top {args.matches} injected per note[/dim]"
+    )
 
     # Build shared system prompt
     if args.lang == "en":
@@ -820,7 +1122,6 @@ Examples:
         extra_block = f"\nADDITIONAL INSTRUCTIONS:\n{args.instructions}\n"
 
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        examples=examples_to_prompt(examples),
         lang_instruction=lang_instruction,
         extra_instructions=extra_block,
     )
@@ -857,6 +1158,8 @@ Examples:
             audit_id=audit_id,
             dry_run=args.dry_run,
             no_images=args.no_images,
+            index=index,
+            n_matches=args.matches,
         )
         (ok if success else fail).append(md_file.name)
 

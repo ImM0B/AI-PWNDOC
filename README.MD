@@ -42,10 +42,11 @@ Takes a folder of Obsidian-style `.md` notes — one per vulnerability — analy
 Each `.md` is an auditor's raw note. Images are referenced inline using Obsidian syntax (`![[image.png]]`) and must sit in the same folder as the note. The script:
 
 1. Parses each note and extracts embedded image references
-2. Calls the AI to generate structured vulnerability JSON (title, description, observation, remediation, CVSS, etc.)
-3. Calls the AI again per image to generate a technical description and caption
-4. Uploads images to PwnDoc and assembles the `poc` field with descriptions + inline images + `alt` captions
-5. Pushes the finding to the selected (or newly created) audit
+2. **Searches the knowledge base** (`-e vulnerabilities.yml`) for the write-ups closest to the note
+3. Calls the AI to generate structured vulnerability JSON (title, description, observation, remediation, CVSS, etc.), **reusing the matching knowledge base entry literally** when there is one
+4. Calls the AI again per image to generate a technical description and caption
+5. Uploads images to PwnDoc and assembles the `poc` field with descriptions + inline images + `alt` captions
+6. Pushes the finding to the selected (or newly created) audit
 
 ### Field semantics
 
@@ -53,6 +54,8 @@ Each `.md` is an auditor's raw note. Images are referenced inline using Obsidian
 |---|---|
 | `description` | Theoretical explanation of the vulnerability class — how it works, why it exists, generic attack scenario. No client names, hosts, URLs or engagement-specific evidence. |
 | `observation` | Impact of this specific finding, explicitly covering **confidentiality**, **integrity** and **availability**. If a property is not affected, that is stated too. |
+
+These semantics apply to text the AI writes itself. When a knowledge base entry matches, its text wins and is copied as-is — see [Knowledge base](#knowledge-base--e).
 
 ---
 
@@ -126,21 +129,62 @@ llm:
 
 ---
 
-## Examples file
+## Knowledge base (`-e`)
 
-Pass a `.yml` with real vulnerability examples from past reports. The AI learns your writing style, tone, and technical level from them.
+The `.yml` passed with `-e` is not just a style sample — it is the **source of truth for the wording**. For every note the script ranks the whole file and injects the closest entries into the prompt, with a hard instruction: *if one of them covers the same vulnerability, copy `description`, `observation`, `remediation`, `references`, `cvssv3`, `vulnType`, `priority` and `remediationComplexity` character for character, HTML included*. Only details contradicted by the note (versions, ports, affected components) may be adapted; everything else stays byte-identical, so the report keeps the exact terminology the team already agreed on.
+
+A note about *"TLS 1.0 and 1.1 still enabled, RC4 and 3DES accepted"* therefore comes back written with the existing **"Algoritmos de cifrado SSL/TLS obsoletos"** text, not with a fresh paraphrase. Only when nothing in the file matches does the AI write from scratch, imitating the tone, vocabulary and HTML structure of the entries it was shown. The console prints which entry was reused (`reused KB entry: …`) or warns that the finding was `written from scratch`.
+
+### Format
+
+Both shapes are accepted — a PwnDoc export (`Vulnerabilities → Export`) is the intended input:
 
 ```yaml
+# PwnDoc export: one entry per locale under `details`
+- cvssv3: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+  priority: 4
+  remediationComplexity: 2
+  category: null
+  details:
+    - locale: es
+      title: "Inyección SQL"
+      vulnType: "Web"
+      description: "<p>La aplicación concatena la entrada del usuario…</p>"
+      observation: "<p>Confidencialidad: …</p>"
+      remediation: "<p>Utilizar consultas parametrizadas…</p>"
+      references:
+        - "https://owasp.org/www-community/attacks/SQL_Injection"
+```
+
+```yaml
+# Flat list — also works
 - title: "SQL Injection in login endpoint"
   vulnType: "Web"
-  description: "The login form is vulnerable to SQL injection..."
-  observation: "By sending a payload of ' OR 1=1-- ..."
-  remediation: "Use parameterised queries or a prepared statement ORM."
+  description: "<p>The login form is vulnerable to SQL injection…</p>"
+  observation: "<p>By sending a payload of ' OR 1=1--…</p>"
+  remediation: "<p>Use parameterised queries or a prepared statement ORM.</p>"
   remediationComplexity: 2
   priority: 4
   references:
     - "https://owasp.org/www-community/attacks/SQL_Injection"
   cvssv3: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+```
+
+### Retrieval
+
+Matching is lexical (BM25) and runs locally — no embeddings, no extra dependency, no extra API call:
+
+- Only entries whose `locale` matches `--lang` are searchable — verbatim reuse is only valid in the output language. If there are fewer than 5, every locale is used and a warning is printed.
+- The note **filename and its markdown headings** drive the query; the body only refines it, and repeated tokens are capped so a long terminal dump cannot hijack the ranking.
+- Entries scoring below **30% of the best match** are dropped. A clear winner is therefore sent alone; when nothing really matches, up to `--matches` weak entries are sent as style reference only.
+
+Each note prints its candidates with their score and title overlap, so you can see what the AI was given:
+
+```
+  ●  Server-Side Template Injection.md
+  ○  KB matches:
+  ◌   216.4  (100% title)  Server-Side template injection (SSTI)
+  ○  reused KB entry: Server-Side template injection (SSTI)
 ```
 
 ---
@@ -157,7 +201,8 @@ python ai-pwndoc.py <audit-folder> -e vulnerabilities.yml [options]
 | Argument | Short | Description |
 |---|---|---|
 | `folder` | | Folder containing `.md` notes |
-| `--examples` | `-e` | `.yml` file with vulnerability examples (**required**) |
+| `--examples` | `-e` | `.yml` knowledge base of past vulnerabilities (**required**) — matching entries are reused literally |
+| `--matches` | `-k` | Max knowledge base entries injected per note (default: `4`) |
 | `--provider` | `-p` | AI provider: `claude`, `claude-code` or `gemini` (overrides config) |
 | `--model` | `-m` | Model override (overrides config). `claude`: full model id (e.g. `claude-opus-4-5`). `claude-code`: id or alias (`opus`, `sonnet`, `haiku`) |
 | `--config` | `-c` | Path to config file (default: `config.yml`) |
@@ -184,6 +229,9 @@ python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml --provider cla
 
 # Use a more powerful Claude model (Anthropic API)
 python ai-pwndoc.py SampleAudits/ADPentest/ -e vulnerabilities.yml --model claude-opus-4-5
+
+# Show the AI more knowledge base candidates per note
+python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml -k 6
 
 # Inject extra instructions into the prompt
 python ai-pwndoc.py SampleAudits/WebAudit/ -e vulnerabilities.yml --instructions "Always include the CWE identifier in the description."
